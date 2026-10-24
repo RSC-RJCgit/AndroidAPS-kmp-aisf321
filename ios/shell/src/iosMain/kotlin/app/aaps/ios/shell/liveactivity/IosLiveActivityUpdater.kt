@@ -61,7 +61,8 @@ class IosLiveActivityUpdater(
         }
     }
 
-    private fun push() {
+    // Called from the coroutine started in start(); the IOB and COB lookups are suspend functions.
+    private suspend fun push() {
         val glucose = lastBgData.lastBg() ?: return
         val delta = glucoseStatusProvider.glucoseStatusData?.delta
         val bolusIob = iobCobCalculator.calculateIobFromBolus().round()
