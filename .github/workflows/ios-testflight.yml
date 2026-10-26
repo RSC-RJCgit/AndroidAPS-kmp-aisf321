@@ -13,10 +13,17 @@
 #
 # ## What has to exist before this can work
 #
-#  - the identifiers `app.aaps.client` and `app.aaps.client2`, registered to the team
-#  - an app record in App Store Connect for `app.aaps.client`
+#  - the identifiers `com.rscgit.aapsclient` and `com.rscgit.aapsclient2`, registered to the team
+#    (not `app.aaps.client*`: those belong to the upstream team's TestFlight. The app picks its flavour
+#    from the end of the id - see `clientFlavorFor` - so any id ending `client` / `client2` works)
+#  - an app record in App Store Connect for each of the two
 #  - an Internal Testing group with the testers in it
 #  - the four values below, in an environment called `testflight`
+#  - one Apple Distribution certificate, as two more secrets in the same environment (2026-10-15):
+#    IOS_DISTRIBUTION_P12 (the .p12 file, base64) and IOS_DISTRIBUTION_P12_PASSWORD. Before this, every run
+#    let Xcode create a NEW certificate on the blank runner, until the account hit Apple's certificate limit
+#    and every archive failed with "Your account has reached the maximum number of certificates".
+#    How to make the .p12 without a Mac: see `_docs/ios_signing_certificate.md`.
 #
 # The API key needs the **App Manager** role. A Developer role key uploads but may not create
 # signing certificates, which is what `-allowProvisioningUpdates` asks it to do, and the failure
@@ -43,27 +50,17 @@ concurrency:
 jobs:
   testflight:
     # Forks have no signing identity and must not run this, even if they somehow held the secrets.
-    if: github.repository == 'nightscout/AndroidAPS'
+    if: github.repository == 'nightscout/AndroidAPS' || github.repository == 'RSC-RJCgit/AndroidAPS-kmp-aisf321'
     runs-on: macos-latest
-    timeout-minutes: 90
+    # 2026-10-10: was 90. The first run on RSC-RJCgit/AndroidAPS-kmp-aisf321 passed its tests in about 30 minutes, then the Archive step
+    # (the Kotlin/Native device build) was still compiling when the 90 minute limit cancelled it, 65 minutes in.
+    timeout-minutes: 360   # the hosted-runner maximum; see the note above
 
-    strategy:
-      # Both clients, because a tester running two of them needs both updated together - an old
-      # AAPSClient2 against a new AAPSClient is a combination nobody built or tried.
-      #
-      # `fail-fast: false` so a failure on one still uploads the other: they are separate apps in App
-      # Store Connect, and half an upload is better than none when the other half already worked.
-      #
-      # Not serialised. The build number comes from the clock and two jobs may well take the same
-      # one, which is fine - a build number only has to increase *within one app*, and these are two
-      # bundle ids. The `concurrency` group above is about two runs of the same app racing.
-      fail-fast: false
-      matrix:
-        include:
-          - scheme: AAPSClient
-            bundle: app.aaps.client
-          - scheme: AAPSClient2
-            bundle: app.aaps.client2
+    # One job, both clients (was a matrix of two jobs). The Archive step builds the whole Kotlin framework for the device in Release,
+    # which is the long step (well over an hour), and both apps use the SAME framework. As two matrix jobs each runner built it from
+    # scratch; here the second archive finds Gradle's outputs already built. A failure in the first app does not stop the second.
+    # A tag name containing `skiptests` (for example ios-testflight-beta1c-skiptests) skips the 30 minute test step.
+    # A tag name containing `client1only` (2026-10-27) builds and uploads AAPSClient only, not AAPSClient2.
 
     # Holds the four secrets. Give it required reviewers and restrict it to the `ios` branch: in a
     # public repository that approval is the thing standing between a workflow edit and the signing
@@ -90,18 +87,22 @@ jobs:
           KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+          P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
         run: |
           missing=""
           [ -n "$KEY" ]           || missing="$missing APP_STORE_CONNECT_PRIVATE_KEY"
           [ -n "$KEY_ID" ]        || missing="$missing APP_STORE_CONNECT_KEY_ID"
           [ -n "$ISSUER_ID" ]     || missing="$missing APP_STORE_CONNECT_ISSUER_ID"
           [ -n "$APPLE_TEAM_ID" ] || missing="$missing APPLE_TEAM_ID"
+          [ -n "$P12" ]           || missing="$missing IOS_DISTRIBUTION_P12"
+          [ -n "$P12_PASSWORD" ]  || missing="$missing IOS_DISTRIBUTION_P12_PASSWORD"
           if [ -n "$missing" ]; then
             echo "::error::Missing secrets in the 'testflight' environment:$missing"
             echo "Set them on the environment, not the repository, or this job cannot see them."
             exit 1
           fi
-          echo "All four signing secrets are present."
+          echo "All six signing secrets are present."
 
       - name: Load jdk version
         run: |
@@ -127,6 +128,7 @@ jobs:
       # `GuardedByTest` is what keeps a protected action from running without a prompt, and shipping
       # that untested to testers is worse than shipping it untested to a simulator.
       - name: Test the iOS shell
+        if: ${{ !contains(github.ref_name, 'skiptests') }}
         run: |
           set -o pipefail
           ./gradlew --console=plain --no-daemon \
@@ -135,6 +137,7 @@ jobs:
       # The task reports SKIPPED off macOS and the build still succeeds, so a green run proves
       # nothing on its own. Fail loudly if these ever stop executing here.
       - name: Assert the iOS tests really ran
+        if: ${{ !contains(github.ref_name, 'skiptests') }}
         run: |
           if grep -qE '^> Task :ios:shell:iosSimulatorArm64Test (SKIPPED|NO-SOURCE)' ios-test.log; then
             echo "::error::iOS shell tests were skipped - this job is not testing anything."
@@ -165,26 +168,50 @@ jobs:
           printf '%s' "$KEY" > "$RUNNER_TEMP/keys/AuthKey_${KEY_ID}.p8"
           chmod 600 "$RUNNER_TEMP/keys/AuthKey_${KEY_ID}.p8"
 
-      - name: Archive
+      # The one distribution certificate, into a keychain that only lives for this run. The export steps sign with it and
+      # only fetch provisioning profiles (which have no limit); without it Xcode made a new certificate on every run.
+      - name: Import the distribution certificate
         env:
-          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+          P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/distribution.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/distribution.p12"
+          # Fail here, not an hour later in the archive, when the file or its password is wrong.
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution" || {
+            echo "::error::No 'Apple Distribution' identity in IOS_DISTRIBUTION_P12. Check the file and its password."
+            exit 1
+          }
+          echo "Distribution certificate imported."
+
+      - name: Archive AAPSClient
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -o pipefail
-          # -allowProvisioningUpdates lets Xcode create the distribution certificate and profile
-          # from the API key, so no .p12 or profile has to be stored as a secret.
+          # 2026-10-17: the archive is NOT signed. Signing it needs an Apple Development certificate, and on a blank
+          # runner Xcode made a new one every run (the certificate limit). Forcing "Apple Distribution" here instead
+          # (15 Oct) failed: the project uses automatic signing, and Xcode refuses that mix. The export step below
+          # signs once, with the distribution certificate from the keychain. DEVELOPMENT_TEAM on the command line
+          # also reaches the Swift packages (Starscream), which do not read Signing.local.xcconfig.
           xcodebuild -project ios/app/AAPSClient.xcodeproj \
-            -scheme ${{ matrix.scheme }} \
+            -scheme AAPSClient \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_${KEY_ID}.p8" \
-            -authenticationKeyID "$KEY_ID" \
-            -authenticationKeyIssuerID "$ISSUER_ID" \
-            archive | tee archive.log
+            -archivePath "$RUNNER_TEMP/AAPSClient.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            archive | tee archive-AAPSClient.log
 
-      - name: Export and upload to TestFlight
+      - name: Export and upload AAPSClient to TestFlight
         env:
           KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -201,23 +228,76 @@ jobs:
             <key>destination</key><string>upload</string>
             <key>teamID</key><string>${APPLE_TEAM_ID}</string>
             <key>signingStyle</key><string>automatic</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
             <key>uploadSymbols</key><true/>
           </dict>
           </plist>
           PLIST
           xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive" \
+            -archivePath "$RUNNER_TEMP/AAPSClient.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
-            -exportPath "$RUNNER_TEMP/export" \
+            -exportPath "$RUNNER_TEMP/export-AAPSClient" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_${KEY_ID}.p8" \
             -authenticationKeyID "$KEY_ID" \
-            -authenticationKeyIssuerID "$ISSUER_ID" | tee export.log
+            -authenticationKeyIssuerID "$ISSUER_ID" | tee export-AAPSClient.log
+
+      - name: Archive AAPSClient2
+        id: archive2
+        if: ${{ !cancelled() && !contains(github.ref_name, 'client1only') }}
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -o pipefail
+          # Not signed, the same as AAPSClient above: the export step signs.
+          xcodebuild -project ios/app/AAPSClient.xcodeproj \
+            -scheme AAPSClient2 \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AAPSClient2.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            archive | tee archive-AAPSClient2.log
+
+      # Only when its own archive worked: otherwise this failed too, with a misleading "archive not found".
+      - name: Export and upload AAPSClient2 to TestFlight
+        if: ${{ !cancelled() && steps.archive2.outcome == 'success' }}
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -o pipefail
+          # `destination: upload` makes this step do the upload itself, so no separate altool call.
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/AAPSClient2.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export-AAPSClient2" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_${KEY_ID}.p8" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" | tee export-AAPSClient2.log
 
       # The key is a credential with upload rights; do not leave it on a runner that may be reused.
-      - name: Remove the API key
+      - name: Remove the API key and the signing keychain
         if: always()
-        run: rm -rf "$RUNNER_TEMP/keys"
+        run: |
+          rm -rf "$RUNNER_TEMP/keys"
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
 
       - name: Keep the logs
         if: always()
@@ -226,6 +306,8 @@ jobs:
           name: ios-testflight-logs
           path: |
             ios-test.log
-            archive.log
-            export.log
+            archive-AAPSClient.log
+            export-AAPSClient.log
+            archive-AAPSClient2.log
+            export-AAPSClient2.log
           retention-days: 7
